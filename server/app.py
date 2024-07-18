@@ -1,118 +1,151 @@
-
 #!/usr/bin/env python3
 
-from flask import request, session
+from flask import request, session, jsonify
 from flask_restful import Resource
 from sqlalchemy.exc import IntegrityError
+
 from config import app, db, api
 from models import User, Recipe
 
+
 class Signup(Resource):
     def post(self):
-        json = request.get_json()
-        user = User()
+        data = request.get_json()
+        required_fields = ['username', 'password', 'image_url', 'bio']
+        if not all(field in data for field in required_fields):
+            missing_fields = ", ".join([field for field in required_fields if field not in data])
+            return {"error": f"Missing fields: {missing_fields}"}, 422
+        
         try:
-            user.username = json.get('username', '')
-            user.password_hash = json.get('password')  # Correctly sets _password_hash
-            user.bio = json.get('bio')
-            user.image_url = json.get('image_url')
+            user = User(
+                username=data['username'],
+                image_url=data['image_url'],
+                bio=data['bio']
+            )
+            user.set_password(data['password'])
             db.session.add(user)
             db.session.commit()
             session['user_id'] = user.id
             return {
-                'user_id': session['user_id'],
-                'username': user.username,
-                'image_url': user.image_url,
-                'bio': user.bio
+                "id": user.id,
+                "username": user.username,
+                "image_url": user.image_url,
+                "bio": user.bio
             }, 201
         except IntegrityError:
             db.session.rollback()
-            return {'message': 'Error creating user: username already exists'}, 422
-        except Exception as e:
-            db.session.rollback()
-            return {'message': f'Error creating user: {str(e)}'}, 422
+            return {"error": "Username already exists or other integrity error"}, 422
 
 class CheckSession(Resource):
     def get(self):
         user_id = session.get('user_id')
-        if user_id:
-            user = User.query.filter(User.id == user_id).first()
-            if user:
-                return user_to_dict(user), 200
-            else:
-                return {'message': 'User not found'}, 404
-        else:
-            return {'message': 'User not logged in'}, 401
+        if not user_id:
+            return {"error": "Unauthorized"}, 401
+        user = db.session.get(User, user_id)
+        if not user:
+            return {"error": "User not found"}, 404
+        return {
+            "id": user.id,
+            "username": user.username,
+            "image_url": user.image_url,
+            "bio": user.bio
+        }, 200
 
 class Login(Resource):
     def post(self):
-        json = request.get_json()
-        username = json.get('username')
-        password = json.get('password')
-        if username and password:
-            user = User.query.filter(User.username == username).first()
-            if user and user.check_password(password):
-                session['user_id'] = user.id
-                return user_to_dict(user), 200
-            else:
-                return {'message': 'Username and password do not match any users'}, 401
-        else:
-            return {'message': 'Username and password are required'}, 400
+        data = request.get_json()
+        user = User.query.filter_by(username=data['username']).first()
+        if user and user.check_password(data['password']):
+            session['user_id'] = user.id
+            return {
+                "id": user.id,
+                "username": user.username,
+                "image_url": user.image_url,
+                "bio": user.bio
+            }, 200
+        return {"error": "Invalid credentials"}, 401
+
 class Logout(Resource):
     def delete(self):
-        if session.get('user_id'):
-            session['user_id'] = None
-            return {'message': 'Successfully Logged Out'}, 204
-        else:
-            return {'message': 'Cannot logout: not logged in'}, 401
+        user_id = session.pop('user_id', None)
+        if not user_id:
+            return {"error": "No user to log out"}, 401
+        return {}, 204
 
 class RecipeIndex(Resource):
     def get(self):
-        if session.get('user_id'):
-            recipes = [{
-                'title': recipe.title,
-                'instructions': recipe.instructions,
-                'minutes_to_complete': recipe.minutes_to_complete,
-                'user': user_to_dict(User.query.filter_by(id=recipe.user_id).first())
-            } for recipe in Recipe.query.all()]
-            return recipes, 200
-        else:
-            return {'message': 'Must be logged in to view'}, 401
-
-    def post(self):
-        if session.get('user_id'):
-            json = request.get_json()
-            recipe = Recipe()
-            try:
-                recipe.title = json.get('title')
-                recipe.instructions = json.get('instructions')
-                recipe.minutes_to_complete = json.get('minutes_to_complete')
-                recipe.user_id = session['user_id']
-                db.session.add(recipe)
-                db.session.commit()
-                recipe_json = {
-                    'title': recipe.title,
-                    'instructions': recipe.instructions,
-                    'minutes_to_complete': recipe.minutes_to_complete,
-                    'user': user_to_dict(User.query.filter_by(id=recipe.user_id).first())
+        print("Fetching user id from session...")
+        user_id = session.get('user_id')
+        if not user_id:
+            print("No user id found in session")
+            return {"error": "Unauthorized"}, 401
+        try:
+            print("Querying recipes for user id:", user_id)
+            recipes = Recipe.query.filter_by(user_id=user_id).all()
+            if not recipes:
+                print("No recipes found for user id:", user_id)
+                return {"error": "No recipes found"}, 404  # Consider returning 404 if no recipes are found
+            print("Building JSON response...")
+            response = [{
+                "title": r.title,
+                "instructions": r.instructions,
+                "minutes_to_complete": r.minutes_to_complete,
+                "user": {
+                    "id": r.user.id if r.user else None,
+                    "username": r.user.username if r.user else "Unknown"
                 }
-                return recipe_json, 201
-            except IntegrityError:
-                db.session.rollback()
-                return {'message': 'Recipe could not be created: integrity error'}, 422
-            except Exception as e:
-                db.session.rollback()
-                return {'message': f'Recipe could not be created: {str(e)}'}, 422
-        else:
-            return {'message': 'Must be logged in to create a recipe'}, 401
+            } for r in recipes]
+            print("Returning response...")
+            return response, 200
+        except Exception as e:
+            print("Error fetching recipes:", str(e))
+            return {"error": "Server error"}, 500
+    
+    def post(self):
+        user_id = session.get('user_id')
+        if not user_id:
+            app.logger.error('Unauthorized access attempt.')
+            return {"error": "Unauthorized"}, 401
 
-def user_to_dict(user):
-    return {
-        'id': user.id,
-        'username': user.username,
-        'image_url': user.image_url,
-        'bio': user.bio
-    }
+        data = request.get_json(force=True)
+        if not all(k in data for k in ('title', 'instructions', 'minutes_to_complete')):
+            app.logger.error('Missing required fields: {}'.format(data))
+            return {"error": "Missing required recipe fields"}, 422
+
+        try:
+            if len(data['instructions']) < 50:
+                raise ValueError("Instructions must be at least 50 characters long.")
+            
+            if not data.get('title') or not data.get('instructions') or not data.get('minutes_to_complete'):
+                raise ValueError("All fields must be provided.")
+
+            recipe = Recipe(
+                title=data['title'],
+                instructions=data['instructions'],
+                minutes_to_complete=data['minutes_to_complete'],
+                user_id=user_id
+            )
+            db.session.add(recipe)
+            db.session.commit()
+            return {
+                "title": recipe.title,
+                "instructions": recipe.instructions,
+                "minutes_to_complete": recipe.minutes_to_complete,
+                "user": {
+                    "id": recipe.user.id,
+                    "username": recipe.user.username
+                }
+            }, 201
+        except ValueError as ve:
+            app.logger.error(f'Validation error on creating recipe: {str(ve)}')
+            return {"error": str(ve)}, 422
+        except IntegrityError as ie:
+            db.session.rollback()
+            app.logger.error(f'IntegrityError on creating recipe: {str(ie)}')
+            return {"error": "Database error, could not create recipe"}, 422
+        except Exception as e:
+            app.logger.error(f'Unexpected error on creating recipe: {str(e)}')
+            return {"error": "Server error"}, 500
 
 api.add_resource(Signup, '/signup', endpoint='signup')
 api.add_resource(CheckSession, '/check_session', endpoint='check_session')
